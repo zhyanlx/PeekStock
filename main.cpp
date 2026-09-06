@@ -669,9 +669,9 @@ static Layout GetLayout(int W) {
         L.rows[i].cost = Rect(L.rows[i].del.X - S(5) - S(kRowBtnW), rowY + S(3), S(kRowBtnW), S(kRowBtnH));
     }
     L.idxY = S(kRowY0) + n * S(kRowStep) - S(3) + S(5);
-    // 与 Qt 版对齐修正一致: 指数行比个股行多 3px 左缩进
-    L.idxNameX = S(12) + S(3);
-    L.idxValueX = S(87) + S(3);
+    // GDI+ 渲染下数字与汉字墨迹边距相同, 指数列与个股列同起点即可精确对齐
+    L.idxNameX = S(12);
+    L.idxValueX = S(76);
     return L;
 }
 
@@ -709,11 +709,12 @@ static void PaintFull(Graphics& g, int W, int H) {
         const StockItem& it = g_st.items[i];
         int rowY = S(kRowY0) + (int)i * S(kRowStep);
 
-        DrawLabel(g, it.display, Rect(S(12), rowY, S(70), S(kRowH)), g_fontUI, ColWhite());
+        DrawLabel(g, it.display, Rect(S(12), rowY, S(58), S(kRowH)), g_fontUI, ColWhite());
 
         // 价格区: [名称 现价 (涨跌)] 同色 + [ (持x%) ] 独立颜色
-        int priceX = S(87);
-        g.SetClip(RectF((REAL)priceX, (REAL)rowY, REAL(S(240)), REAL(S(kRowH))));
+        int priceX = S(76);
+        int clipW = L.rows[i].cost.X - S(6) - priceX;   // 到成本按钮左侧为止, 避免持仓文字被裁
+        g.SetClip(RectF((REAL)priceX, (REAL)rowY, REAL(clipW), REAL(S(kRowH))));
         double rate = it.prev > 0 ? (it.curr - it.prev) / it.prev * 100.0 : 0.0;
         Color mainCol = it.hasData ? RateColor(rate) : ColWhite();
         std::wstring main = it.hasData ? (it.name + L" " + Fmt2(it.curr) + L" " + FmtRate(rate))
@@ -738,7 +739,7 @@ static void PaintFull(Graphics& g, int W, int H) {
             g.MeasureString(main.c_str(), (INT)main.size(), g_fontUI, PointF(0, 0), &sf, &m);
             g.DrawString(cs.c_str(), (INT)cs.size(), g_fontUI,
                          RectF((REAL)priceX + m.Width, (REAL)rowY,
-                               REAL(S(240) - (int)m.Width), REAL(S(kRowH))), &sf, &br);
+                               REAL(clipW - (int)m.Width), REAL(S(kRowH))), &sf, &br);
         }
         g.ResetClip();
 
@@ -952,8 +953,7 @@ static void RebuildCompact() {
     for (const StockItem& it : g_st.items) {
         CompactLine cl;
         if (it.hasData) {
-            cl.main = it.display + L" ";
-            if (!it.name.empty()) cl.main += it.name + L" ";
+            cl.main = it.name.empty() ? L"" : it.name + L" ";
             cl.main += Fmt2(it.curr) + L" ";
             double rate = it.prev > 0 ? (it.curr - it.prev) / it.prev * 100.0 : 0.0;
             cl.rate = FmtRate(rate);
@@ -961,10 +961,10 @@ static void RebuildCompact() {
             cl.hasRate = true;
             if (it.cost > 0 && it.curr > 0) {
                 double cr = (it.curr - it.cost) / it.cost * 100.0;
-                cl.main += L"(持" + std::wstring(cr > 0 ? L"+" : L"") + Fmt2(cr) + L"%) ";
+                cl.rate += L" (持" + std::wstring(cr > 0 ? L"+" : L"") + Fmt2(cr) + L"%)";
             }
         } else {
-            cl.main = it.display + L" 加载中...";
+            cl.main = L"加载中...";
         }
         g_st.compactLines.push_back(cl);
     }
@@ -1278,6 +1278,7 @@ static void ShowCostDialog(int idx) {
     wc.lpfnWndProc = DlgProc;
     wc.hInstance = g_hInst;
     wc.lpszClassName = APP_DLGCLS;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
     g_dlg.input.rc = Rect(S(14), S(56), w - S(28), S(24));
@@ -1550,6 +1551,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = APP_CLASS;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);   // 不设置的话会一直显示启动转圈光标
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
