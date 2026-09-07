@@ -753,7 +753,7 @@ static void PaintFull(Graphics& g, int W, int H) {
               g_fontUI, RateColor(g_st.idx.rate));
 }
 
-// 精简模式: 低调水印风 — 雅黑9pt 灰调正文 + 低饱和涨跌色 + 柔和阴影
+// 精简模式: 低调水印风 — 雅黑9pt 灰调正文, 无阴影 (白底/深底都不显脏)
 static void PaintCompact(Graphics& g, int W, int H) {
     g.SetTextRenderingHint(TextRenderingHintAntiAlias);
     StringFormat sf;
@@ -763,74 +763,22 @@ static void PaintCompact(Graphics& g, int W, int H) {
 
     REAL lineH = g_fontCompact->GetHeight(&g);
     int x = S(12), y0 = S(8);
-
-    // shadowPass=true 时全部画黑(作阴影源); false 时画灰调正文+低饱和涨跌色
-    auto drawSegments = [&](Graphics& gg, bool shadowPass) {
-        SolidBrush blk(Color(190, 0, 0, 0));
-        SolidBrush grayBr(Color(215, 184, 184, 184));
-        for (size_t i = 0; i < g_st.compactLines.size(); i++) {
-            const CompactLine& cl = g_st.compactLines[i];
-            if (cl.main.empty() && cl.rate.empty()) continue;
-            REAL ry = (REAL)(y0 + (int)(i * lineH));
-            REAL cx = (REAL)x;
-            SolidBrush* mb = shadowPass ? (SolidBrush*)&blk : &grayBr;
-            SolidBrush* rb = shadowPass ? (SolidBrush*)&blk : &grayBr;   // 极简模式无颜色, 仅用±号区分
-            if (!cl.main.empty()) {
-                gg.DrawString(cl.main.c_str(), (INT)cl.main.size(), g_fontCompact,
-                              RectF(cx, ry, REAL(W), lineH), &sf, mb);
-                cx += TextWidth(gg, cl.main, g_fontCompact);
-            }
-            if (!cl.rate.empty()) {
-                gg.DrawString(cl.rate.c_str(), (INT)cl.rate.size(), g_fontCompact,
-                              RectF(cx, ry, REAL(W), lineH), &sf, rb);
-            }
+    SolidBrush grayBr(Color(215, 184, 184, 184));
+    for (size_t i = 0; i < g_st.compactLines.size(); i++) {
+        const CompactLine& cl = g_st.compactLines[i];
+        if (cl.main.empty() && cl.rate.empty()) continue;
+        REAL ry = (REAL)(y0 + (int)(i * lineH));
+        REAL cx = (REAL)x;
+        if (!cl.main.empty()) {
+            g.DrawString(cl.main.c_str(), (INT)cl.main.size(), g_fontCompact,
+                         RectF(cx, ry, REAL(W), lineH), &sf, &grayBr);
+            cx += TextWidth(g, cl.main, g_fontCompact);
         }
-    };
-
-    // 1) 阴影源
-    Bitmap srcBmp(W, H, PixelFormat32bppARGB);
-    {
-        Graphics tg(&srcBmp);
-        tg.SetTextRenderingHint(TextRenderingHintAntiAlias);
-        drawSegments(tg, true);
+        if (!cl.rate.empty()) {
+            g.DrawString(cl.rate.c_str(), (INT)cl.rate.size(), g_fontCompact,
+                         RectF(cx, ry, REAL(W), lineH), &sf, &grayBr);
+        }
     }
-    // 2) 两趟盒模糊近似高斯
-    const int R = 6;
-    {
-        BitmapData bd;
-        Rect r(0, 0, W, H);
-        srcBmp.LockBits(&r, ImageLockModeRead | ImageLockModeWrite, PixelFormat32bppARGB, &bd);
-        BYTE* base = (BYTE*)bd.Scan0;
-        int stride = bd.Stride;
-        std::vector<BYTE> tmpA(std::max(W, H));
-        for (int yy = 0; yy < H; yy++) {
-            BYTE* row = base + (size_t)yy * stride + 3;
-            for (int xx = 0; xx < W; xx++) {
-                int sum = 0, cnt = 0;
-                for (int d = -R; d <= R; d++) {
-                    int x2 = xx + d;
-                    if (x2 >= 0 && x2 < W) { sum += row[x2 * 4]; cnt++; }
-                }
-                tmpA[xx] = (BYTE)(sum / cnt);
-            }
-            for (int xx = 0; xx < W; xx++) row[xx * 4] = tmpA[xx];
-        }
-        for (int xx = 0; xx < W; xx++) {
-            for (int yy = 0; yy < H; yy++) {
-                int sum = 0, cnt = 0;
-                for (int d = -R; d <= R; d++) {
-                    int y2 = yy + d;
-                    if (y2 >= 0 && y2 < H) { sum += base[(size_t)y2 * stride + xx * 4 + 3]; cnt++; }
-                }
-                tmpA[yy] = (BYTE)(sum / cnt);
-            }
-            for (int yy = 0; yy < H; yy++) base[(size_t)yy * stride + xx * 4 + 3] = tmpA[yy];
-        }
-        srcBmp.UnlockBits(&bd);
-    }
-    // 3) 阴影(1,1) + 灰调正文
-    g.DrawImage(&srcBmp, S(1), S(1));
-    drawSegments(g, false);
 }
 
 // ---------------------------------------------------------------------------
