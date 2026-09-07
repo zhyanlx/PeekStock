@@ -8,3 +8,6 @@ dscv_log.txt
 
 # Python 缓存 (历史测试脚本遗留)
 __pycache__/
+
+# 资源编译产物 (build.bat 自动生成)
+*.res
