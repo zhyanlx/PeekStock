@@ -51,6 +51,7 @@ static const int kRowY0 = 39, kRowH = 30;
 static const int kBtnAddW = 55, kBtnSortW = 60, kBtnFixW = 55, kBtnCloseW = 26;
 static const int kRowBtnW = 45, kRowBtnH = 24;
 static const ULONGLONG kFetchIntervalMs = 5000;
+static const int kNoWinPos = 1 << 30;   // 窗口位置哨兵: 未记录(配置文件里可含负坐标, 故不能用 -1)
 
 // 颜色与 Qt 版一致 (green=#00FF00, red=#FF0000)
 static Color ColPanel()    { return Color(230, 30, 30, 30); }
@@ -72,10 +73,8 @@ static ULONG_PTR   g_gdipToken = 0;
 static HINTERNET   g_hSession = NULL;
 static float       g_scale = 1.0f;          // dpi/96
 static FontFamily* g_famUI = NULL;          // Microsoft YaHei
-static FontFamily* g_famMono = NULL;        // Consolas
 static Font*       g_fontUI = NULL;         // 10pt
 static Font*       g_fontBtn = NULL;        // 9pt
-static Font*       g_fontMono = NULL;       // Consolas 10pt bold (已弃用, 保留)
 static Font*       g_fontCompact = NULL;    // 雅黑 9pt 常规 (精简模式低调字体)
 
 static inline int S(int v) { return (int)(v * g_scale + 0.5f); }
@@ -510,8 +509,6 @@ enum HoverTarget {
 struct CompactLine {
     std::wstring main;      // 代码 名称 现价 (灰色)
     std::wstring rate;      // (+x.xx%) (低饱和色)
-    double rateVal = 0;
-    bool hasRate = false;
 };
 
 struct AppState {
@@ -526,6 +523,7 @@ struct AppState {
     int hoverRow = -1;
     bool dragging = false;
     POINT dragOff = {0, 0};
+    int winX = kNoWinPos, winY = kNoWinPos;   // 记住的窗口位置(屏幕坐标, 未记录=kNoWinPos)
     bool fetchRunning = false;
     bool nameRunning = false;
     ULONGLONG lastFetchTick = 0;
@@ -560,7 +558,13 @@ static std::wstring ConfigSerialize(const std::vector<StockItem>& items) {
 static void SaveConfig() {
     std::wstring path = GetConfigPath();
     std::wstring tmp = path + L".tmp";
-    std::string u8 = WToUtf8(ConfigSerialize(g_st.items));
+    // {"win_x":..., "win_y":..., "items":[...]}  ; items 段格式不变, 旧版 ParseConfig 仍可解析
+    std::wstring s = L"{\"win_x\": ";
+    s += (g_st.winX != kNoWinPos) ? std::to_wstring(g_st.winX) : L"null";
+    s += L", \"win_y\": ";
+    s += (g_st.winY != kNoWinPos) ? std::to_wstring(g_st.winY) : L"null";
+    s += L", \"items\": " + ConfigSerialize(g_st.items) + L"}";
+    std::string u8 = WToUtf8(s);
     HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -568,6 +572,32 @@ static void SaveConfig() {
     WriteFile(f, u8.data(), (DWORD)u8.size(), &wr, NULL);
     CloseHandle(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+// 把当前窗口位置写入配置 (拖动结束 / 退出时调用)
+static void SaveWindowPos() {
+    if (!g_st.hwnd || !IsWindow(g_st.hwnd)) return;
+    RECT r;
+    if (!GetWindowRect(g_st.hwnd, &r)) return;
+    g_st.winX = r.left;
+    g_st.winY = r.top;
+    SaveConfig();
+}
+
+// 读配置 JSON 里的整数字段; 键不存在或值为 null 时返回 def
+static int ConfigGetInt(const std::wstring& text, const wchar_t* key, int def) {
+    std::wstring k = std::wstring(L"\"") + key + L"\"";
+    size_t p = text.find(k);
+    if (p == std::wstring::npos) return def;
+    size_t colon = text.find(L':', p);
+    if (colon == std::wstring::npos) return def;
+    size_t n = colon + 1;
+    while (n < text.size() && text[n] == L' ') n++;
+    if (n >= text.size() || text[n] == L'n') return def;   // null
+    wchar_t* endp = NULL;
+    double v = wcstod(text.c_str() + n, &endp);
+    if (!endp || endp == text.c_str() + n) return def;
+    return (int)v;
 }
 
 static void LoadConfig() {
@@ -579,7 +609,31 @@ static void LoadConfig() {
     char buf[4096]; DWORD rd = 0;
     while (ReadFile(f, buf, sizeof(buf), &rd, NULL) && rd > 0) bytes.append(buf, rd);
     CloseHandle(f);
-    std::vector<ConfigEntry> list = ParseConfig(Utf8ToW(bytes));
+    std::wstring wtext = Utf8ToW(bytes);
+
+    // 恢复窗口位置: 记录坐标须在虚拟屏内, 否则(或无记录/屏幕变更)放主屏工作区中央 — 不再默认左上角
+    if (g_st.hwnd && IsWindow(g_st.hwnd)) {
+        RECT rc;
+        if (GetWindowRect(g_st.hwnd, &rc)) {
+            int w = rc.right - rc.left, h = rc.bottom - rc.top;
+            int x = ConfigGetInt(wtext, L"win_x", kNoWinPos);
+            int y = ConfigGetInt(wtext, L"win_y", kNoWinPos);
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if (x == kNoWinPos || y == kNoWinPos ||
+                x < vx || x >= vx + vw || y < vy || y >= vy + vh) {
+                RECT wa;
+                SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+                x = wa.left + (wa.right - wa.left - w) / 2;
+                y = wa.top + (wa.bottom - wa.top - h) / 2;
+            }
+            g_st.winX = x; g_st.winY = y;
+            SetWindowPos(g_st.hwnd, NULL, x, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    std::vector<ConfigEntry> list = ParseConfig(wtext);
     for (const ConfigEntry& e : list) {
         const std::wstring& full = e.code6;
         if (full.size() != 6) continue;
@@ -589,7 +643,7 @@ static void LoadConfig() {
         std::wstring code = (full[0] == L'6' ? L"sh" : L"sz") + full;
         AddByCode(code, e.hasCost ? e.cost : 0.0, true);
     }
-    // 与 Qt 版一致: 批量加载后统一保存并刷新一次
+    // 与 Qt 版一致: 批量加载后统一保存并刷新一次 (位置已恢复, 一并写回)
     SaveConfig();
 }
 
@@ -691,7 +745,7 @@ static void DrawButton(Graphics& g, const Rect& rc, const std::wstring& text,
 static void PaintFull(Graphics& g, int W, int H) {
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     FillRoundRect(g, ColPanel(), Rect(0, 0, W, H), S(6));
-    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 
     Layout L = GetLayout(W);
     g_st.input.rc = L.input;   // 供命中测试使用
@@ -755,7 +809,7 @@ static void PaintFull(Graphics& g, int W, int H) {
 
 // 精简模式: 低调水印风 — 雅黑9pt 灰调正文, 无阴影 (白底/深底都不显脏)
 static void PaintCompact(Graphics& g, int W, int H) {
-    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     StringFormat sf;
     sf.SetAlignment(StringAlignmentNear);
     sf.SetLineAlignment(StringAlignmentCenter);
@@ -817,6 +871,22 @@ static void TryFetch() {
     g_st.fetchThread = h;
 }
 
+// 按当前排序方向(g_st.sortAsc)重排: 有行情的按涨跌幅排序, 无行情的稳定排在末尾
+static void ApplySort() {
+    std::vector<StockItem> valid, invalid;
+    for (const StockItem& it : g_st.items) {
+        if (it.prev > 0 && it.curr > 0) valid.push_back(it);
+        else invalid.push_back(it);
+    }
+    std::stable_sort(valid.begin(), valid.end(), [asc = g_st.sortAsc](const StockItem& a, const StockItem& b) {
+        double ra = (a.curr - a.prev) / a.prev;
+        double rb = (b.curr - b.prev) / b.prev;
+        return asc ? (ra < rb) : (ra > rb);
+    });
+    g_st.items = valid;
+    for (const StockItem& it : invalid) g_st.items.push_back(it);
+}
+
 static void ApplyFetchResult(FetchResult* res) {
     g_st.fetchRunning = false;
     if (g_st.fetchThread) { CloseHandle(g_st.fetchThread); g_st.fetchThread = NULL; }
@@ -831,6 +901,7 @@ static void ApplyFetchResult(FetchResult* res) {
             }
         }
         g_st.idx = res->idx;
+        ApplySort();   // 实时按涨跌幅重排(保持当前方向)
     } else {
         // 请求失败: 指数显示 --，个股保持旧值 (与 Qt 版一致)
         g_st.idx.name = L"上证指数";
@@ -878,18 +949,7 @@ static void RemoveItem(int idx) {
 
 static void ToggleSort() {
     g_st.sortAsc = !g_st.sortAsc;
-    std::vector<StockItem> valid, invalid;
-    for (const StockItem& it : g_st.items) {
-        if (it.prev > 0 && it.curr > 0) valid.push_back(it);
-        else invalid.push_back(it);
-    }
-    std::stable_sort(valid.begin(), valid.end(), [asc = g_st.sortAsc](const StockItem& a, const StockItem& b) {
-        double ra = (a.curr - a.prev) / a.prev;
-        double rb = (b.curr - b.prev) / b.prev;
-        return asc ? (ra < rb) : (ra > rb);
-    });
-    g_st.items = valid;
-    for (const StockItem& it : invalid) g_st.items.push_back(it);
+    ApplySort();
     Render();
 }
 
@@ -905,8 +965,6 @@ static void RebuildCompact() {
             cl.main += Fmt2(it.curr) + L" ";
             double rate = it.prev > 0 ? (it.curr - it.prev) / it.prev * 100.0 : 0.0;
             cl.rate = FmtRate(rate);
-            cl.rateVal = rate;
-            cl.hasRate = true;
             if (it.cost > 0 && it.curr > 0) {
                 double cr = (it.curr - it.cost) / it.cost * 100.0;
                 cl.rate += L" (持" + std::wstring(cr > 0 ? L"+" : L"") + Fmt2(cr) + L"%)";
@@ -925,8 +983,6 @@ static void RebuildCompact() {
         g_st.idx.value.find(L"加载中") == std::wstring::npos) {
         idx.main += g_st.idx.value.substr(0, sp) + L" ";
         idx.rate = g_st.idx.value.substr(sp + 1);
-        idx.rateVal = g_st.idx.rate;
-        idx.hasRate = true;
     } else {
         idx.main += g_st.idx.value;
     }
@@ -1063,7 +1119,7 @@ static void DlgRender() {
         Graphics g(g_dlg.mdc);
         g.Clear(Color(1, 0, 0, 0));
         g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
         FillRoundRect(g, Color(255, 30, 30, 30), Rect(0, 0, w, h), S(6));
         DrawLabel(g, L"设置成本价", Rect(S(14), S(8), w - S(28), S(22)), g_fontUI,
                   ColWhite(), StringAlignmentNear, StringAlignmentNear);
@@ -1421,6 +1477,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_st.dragging) {
             g_st.dragging = false;
             ReleaseCapture();
+            SaveWindowPos();   // 拖动结束 → 记住位置
         }
         return 0;
     case WM_CAPTURECHANGED:
@@ -1437,6 +1494,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Render();
         return 0;
     case WM_DESTROY: {
+        SaveWindowPos();   // 退出兜底: 记录最后位置
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
         UnregisterHotKey(hwnd, 1);
@@ -1469,12 +1527,10 @@ static void InitGraphics() {
 
     g_scale = dpi / 96.0f;
     g_famUI = new FontFamily(L"Microsoft YaHei");
-    g_famMono = new FontFamily(L"Consolas");
     REAL emUI = dpi * 10.0f / 72.0f;    // 10pt
     REAL emBtn = dpi * 9.0f / 72.0f;    // 9pt
     g_fontUI = new Font(g_famUI, emUI, FontStyleRegular, UnitPixel);
     g_fontBtn = new Font(g_famUI, emBtn, FontStyleRegular, UnitPixel);
-    g_fontMono = new Font(g_famMono, emUI, FontStyleBold, UnitPixel);
     g_fontCompact = new Font(g_famUI, emBtn, FontStyleRegular, UnitPixel);   // 9pt
 }
 
