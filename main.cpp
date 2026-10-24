@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdarg>
 #include <cwchar>
 #include <process.h>
 
@@ -232,8 +233,9 @@ static void ParseQuotes(const std::wstring& body, FetchResult& out) {
         if (eq == std::wstring::npos) continue;
         std::wstring code = line.substr(v + 2, eq - v - 2);
         size_t q1 = line.find(L'"', eq);
+        if (q1 == std::wstring::npos) continue;
         size_t q2 = line.find(L'"', q1 + 1);
-        if (q1 == std::wstring::npos || q2 == std::wstring::npos || q2 <= q1 + 1) continue;
+        if (q2 == std::wstring::npos || q2 <= q1 + 1) continue;
         std::wstring payload = line.substr(q1 + 1, q2 - q1 - 1);
 
         std::vector<std::wstring> f;
@@ -1088,14 +1090,23 @@ struct CostDlgState {
     HWND dlg = NULL;
     HWND owner = NULL;
     LineInput input;
-    int itemIdx = -1;
+    std::wstring itemCode;   // 按代码定位目标股票, 不受行序变化影响
     bool ok = false;
     bool hoverOk = false, hoverCancel = false;
     HDC mdc = NULL;
     HBITMAP mdb = NULL;
     int mw = 0, mh = 0;
 };
+
 static CostDlgState g_dlg;
+static void DlgClose();
+// 弹框目标股票 (按代码查找, 找不到返回 NULL, 如已删除)
+static StockItem* DlgTargetItem() {
+    for (StockItem& it : g_st.items)
+        if (it.code == g_dlg.itemCode) return &it;
+    return NULL;
+}
+
 
 static void DlgRender() {
     if (!g_dlg.dlg) return;
@@ -1123,8 +1134,9 @@ static void DlgRender() {
         FillRoundRect(g, Color(255, 30, 30, 30), Rect(0, 0, w, h), S(6));
         DrawLabel(g, L"设置成本价", Rect(S(14), S(8), w - S(28), S(22)), g_fontUI,
                   ColWhite(), StringAlignmentNear, StringAlignmentNear);
-        std::wstring prompt = g_st.items[g_dlg.itemIdx].display +
-                              L" 成本价（留空确定则清除）：";
+        StockItem* tgt = DlgTargetItem();
+        if (!tgt) { DlgClose(); return; }
+        std::wstring prompt = tgt->display + L" 成本价（留空确定则清除）：";
         DrawLabel(g, prompt, Rect(S(14), S(34), w - S(28), S(18)), g_fontBtn,
                   Color(255, 200, 200, 200), StringAlignmentNear, StringAlignmentCenter);
         InputDraw(g, g_dlg.input, g_fontUI);
@@ -1144,8 +1156,9 @@ static void DlgRender() {
 }
 
 static void CostApply() {
-    if (g_dlg.itemIdx < 0 || g_dlg.itemIdx >= (int)g_st.items.size()) return;
-    StockItem& it = g_st.items[g_dlg.itemIdx];
+    StockItem* tgt = DlgTargetItem();
+    if (!tgt) return;                 // 目标已不存在(被删除), 不做修改
+    StockItem& it = *tgt;
     std::wstring text = g_dlg.input.text;
     size_t b = text.find_first_not_of(L" \t");
     size_t e = text.find_last_not_of(L" \t");
@@ -1266,7 +1279,7 @@ static void ShowCostDialog(int idx) {
     if (idx < 0 || idx >= (int)g_st.items.size()) return;
     g_dlg = CostDlgState();
     g_dlg.owner = g_st.hwnd;
-    g_dlg.itemIdx = idx;
+    g_dlg.itemCode = g_st.items[idx].code;   // 记代码不记下标
     const StockItem& it = g_st.items[idx];
     if (it.cost > 0) g_dlg.input.text = Fmt3(it.cost);
     g_dlg.input.caret = (int)g_dlg.input.text.size();
@@ -1318,6 +1331,7 @@ static void ExpandIfCompact() {
 }
 
 static void CompactIfAllowed() {
+    if (g_dlg.dlg) return;   // 成本弹框打开期间不收缩, 避免背后布局突变
     if (!g_st.fixedWin && !g_st.compact) {
         g_st.compact = true;
         LogA("compact (mouseleave)");
